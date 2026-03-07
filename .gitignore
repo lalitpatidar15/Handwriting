@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# Streamlit
+.streamlit/
+
+# temporary files
+temp_*.jpg
+vanguard_debug.jpg
+*.log
+*.csv
+*.xlsx
+
+# Environment variables
+.env
