@@ -1,0 +1,2 @@
+# Replace file content uses contiguous line replacement, we want to append here so multi_replace is better, or use run command.
+# Wait, I'm just appending to the end so I'll just use run command to echo since it's easy, or rewrite. Let's just use run_command with echo >>

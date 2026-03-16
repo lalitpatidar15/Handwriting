@@ -53,17 +53,17 @@ class DocumentOCREngine:
             # Use larger TrOCR model for better accuracy on clean handwriting
             # Falls back safely if system does not have enough memory
             try:
-                model_id = 'microsoft/trocr-large-handwritten'
-                self.troc_processor = TrOCRProcessor.from_pretrained(model_id)
-                self.troc_model = VisionEncoderDecoderModel.from_pretrained(model_id)
-                print("[OCR] TrOCR-LARGE model loaded successfully!")
-            except Exception:
-                # Fallback to base model if large model cannot be loaded
-                print("[OCR] Large TrOCR model failed, falling back to BASE")
                 model_id = 'microsoft/trocr-base-handwritten'
                 self.troc_processor = TrOCRProcessor.from_pretrained(model_id)
                 self.troc_model = VisionEncoderDecoderModel.from_pretrained(model_id)
                 print("[OCR] TrOCR-BASE model loaded successfully!")
+            except Exception:
+                # Fallback to small model if base model cannot be loaded
+                print("[OCR] BASE TrOCR model failed, falling back to SMALL")
+                model_id = 'microsoft/trocr-small-handwritten'
+                self.troc_processor = TrOCRProcessor.from_pretrained(model_id)
+                self.troc_model = VisionEncoderDecoderModel.from_pretrained(model_id)
+                print("[OCR] TrOCR-SMALL model loaded successfully!")
             if torch.cuda.is_available():
                 self.troc_model.cuda()
             self.troc_loaded = True
