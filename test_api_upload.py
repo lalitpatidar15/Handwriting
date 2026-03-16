@@ -11,7 +11,9 @@ try:
         files = {"file": ("test_dummy.jpg", f, "image/jpeg")}
         data = {
             "cloud_mode": "false",
-            "provider": "gemini",
+            "enterprise_mode": "true",
+            "enterprise_ocr_provider": "documentai",
+            "enterprise_reasoning_provider": "gemini",
             "high_fidelity": "true",
             "force_mode": ""
         }
