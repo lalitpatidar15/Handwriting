@@ -112,12 +112,35 @@ class UniversalDataIntelligence:
         sorted_y_keys = sorted(lines_dict.keys())
         rows = [sorted(lines_dict[y], key=lambda x: x['box'][0][0]) for y in sorted_y_keys] # Sort by xmin
 
-        # 3. Intelligent Decision: Table vs Paragraph
+        # 3. Intelligent Decision: Table/Form vs Paragraph
         all_text_upper = " ".join([str(b.get('text', '')).upper() for b in ocr_results])
         table_anchors = ["QTY", "DESCRIPTION", "HSN", "BATCH", "EXP", "AMOUNT", "PARTICULARS", "PRICE", "TOTAL"]
         force_table = any(anchor in all_text_upper for anchor in table_anchors)
 
-        is_table = force_table
+        # extra heuristic: form-like blanks or huge gaps indicate a structured layout
+        form_gap = False
+        for row in rows:
+            if len(row) < 2:
+                continue
+            # sort by left coordinate
+            sorted_row = sorted(row, key=lambda x: x['box'][0][0])
+            for i in range(len(sorted_row) - 1):
+                gap = sorted_row[i+1]['box'][0][0] - sorted_row[i]['box'][1][0]
+                # if more than half the width of the page is empty between words, treat as a form field
+                if gap > 0.5:
+                    form_gap = True
+                    break
+            if form_gap:
+                break
+        # also treat explicit underscores or long dashes as blanks
+        if not form_gap:
+            for item in ocr_results:
+                text = str(item.get('text', '') or '').strip()
+                if text and (text.count('_') >= 4 or text.count('-') >= 4):
+                    form_gap = True
+                    break
+
+        is_table = force_table or form_gap
         if force_mode == "HANDWRITTEN_NOTE": is_table = False
         elif force_mode == "STRUCTURED_FORM": is_table = True
 
