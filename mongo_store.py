@@ -15,12 +15,26 @@ except Exception:  # pragma: no cover - optional dependency at runtime
     class PyMongoError(Exception):
         pass
 
+try:
+    import mongomock  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - optional dependency at runtime
+    mongomock = None  # type: ignore[assignment]
+
+# Special URI value that activates the in-memory mongomock backend.
+_MONGOMOCK_URI = "mongomock://"
+
 
 class MongoIDPStore:
     def __init__(self, uri: Optional[str], db_name: str = "idp"):
         self.uri = uri
         self.db_name = db_name
-        self.enabled = bool(uri and MongoClient is not None)
+        # Use in-memory mongomock when no real URI is provided (local dev / CI)
+        # or when the URI is explicitly set to the special "mongomock://" value.
+        self._use_mock = bool(
+            mongomock is not None
+            and (not uri or (uri and uri.strip() == _MONGOMOCK_URI))
+        )
+        self.enabled = self._use_mock or bool(uri and MongoClient is not None)
         self._client = None
         self._db = None
         # Cache the last successful ping time so we don't ping MongoDB on
@@ -40,9 +54,13 @@ class MongoIDPStore:
         if self._db is not None:
             return self._db
 
-        assert self.uri is not None
-        assert MongoClient is not None
-        self._client = MongoClient(self.uri, serverSelectionTimeoutMS=3000)
+        if self._use_mock:
+            assert mongomock is not None
+            self._client = mongomock.MongoClient()
+        else:
+            assert self.uri is not None
+            assert MongoClient is not None
+            self._client = MongoClient(self.uri, serverSelectionTimeoutMS=3000)
         self._db = self._client[self.db_name]
 
         self._db.documents.create_index("document_id", unique=True)
