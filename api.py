@@ -1,20 +1,64 @@
 import os
 import shutil
+from contextlib import asynccontextmanager
 from uuid import uuid4
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from database import SessionLocal, engine, Base
 import models
-from main import DocumentIntelligenceSystem
-from universal_parser import UniversalDataIntelligence
-from cloud_ocr import cloud_ocr
-import uvicorn
-import cv2
+from auth_db import connect_to_mongo, close_mongo_connection
+from auth_routes import router as auth_router
 
-# Initialize DB
+import uvicorn
+
+# Initialize SQLite DB tables (for document records)
 models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="DOC-INTEL AI API", version="5.0")
+# Lazy-import heavy AI modules to avoid import-time failures
+DocumentIntelligenceSystem = None
+UniversalDataIntelligence = None
+cloud_ocr = None
+cv2 = None
+
+
+def _load_ai_modules():
+    global DocumentIntelligenceSystem, UniversalDataIntelligence, cloud_ocr, cv2
+    try:
+        from main import DocumentIntelligenceSystem as _DIS
+        from universal_parser import UniversalDataIntelligence as _UDI
+        from cloud_ocr import cloud_ocr as _cocr
+        import cv2 as _cv2
+        DocumentIntelligenceSystem = _DIS
+        UniversalDataIntelligence = _UDI
+        cloud_ocr = _cocr
+        cv2 = _cv2
+    except Exception as e:
+        print(f"⚠️  AI module import failed: {e}. Document processing will be unavailable.")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── Startup ──
+    global system, intelligence
+    print("🚀 DOC-INTEL API starting up...")
+    # Connect to MongoDB for auth
+    await connect_to_mongo()
+    # Load AI engines in a background thread
+    import asyncio
+    _load_ai_modules()
+    if DocumentIntelligenceSystem and UniversalDataIntelligence:
+        try:
+            system = await asyncio.to_thread(DocumentIntelligenceSystem)
+            intelligence = await asyncio.to_thread(UniversalDataIntelligence)
+            print("✅ AI Engines Ready.")
+        except Exception as e:
+            print(f"⚠️  AI engine startup failed: {e}")
+    yield
+    # ── Shutdown ──
+    await close_mongo_connection()
+
+
+app = FastAPI(title="DOC-INTEL AI API", version="5.0", lifespan=lifespan)
 
 # CORS for external apps/frontend
 app.add_middleware(
@@ -25,18 +69,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount auth routes
+app.include_router(auth_router)
+
 # Global instances of our AI Engines
 system = None
 intelligence = None
-
-@app.on_event("startup")
-async def load_ai_models():
-    global system, intelligence
-    print("🚀 Initializing AI Engines for FastAPI...")
-    import asyncio
-    # Run the heavy loading in a separate thread to prevent blocking Uvicorn startup
-    system, intelligence = await asyncio.to_thread(DocumentIntelligenceSystem), await asyncio.to_thread(UniversalDataIntelligence)
-    print("✅ AI Engines Ready.")
 
 # Create permanent upload storage directory (Local S3 equivalent)
 UPLOAD_DIR = "uploads"
@@ -83,13 +121,14 @@ async def process_document(
         print(f"📥 File saved securely to: {file_path}")
 
         # 2. Vision Enhancement (Always run local enhancement first)
-        clean_img = system.ocr.vision.enhance_image(file_path)
         processed_path = file_path
-        if clean_img is not None:
-            processed_path = os.path.abspath(os.path.join(UPLOAD_DIR, f"clean_{unique_filename}"))
-            cv2.imwrite(processed_path, clean_img)
-        else:
-            print("⚠️ Vision enhancement failed or skipped. Using original image.")
+        if system is not None and cv2 is not None:
+            clean_img = system.ocr.vision.enhance_image(file_path)
+            if clean_img is not None:
+                processed_path = os.path.abspath(os.path.join(UPLOAD_DIR, f"clean_{unique_filename}"))
+                cv2.imwrite(processed_path, clean_img)
+            else:
+                print("⚠️ Vision enhancement failed or skipped. Using original image.")
 
         # 3. AI Extraction Logic (Cloud vs Local)
         doc_analysis = {"type": "UNKNOWN", "confidence_score": 0.0}
@@ -98,6 +137,8 @@ async def process_document(
         if cloud_mode:
             print(f"☁️ Cloud Mode Activated: Routing to {provider.upper()} API...")
             try:
+                if cloud_ocr is None:
+                    raise RuntimeError("Cloud OCR module not loaded.")
                 ocr_data = cloud_ocr(file_path, provider=provider)
                 if isinstance(ocr_data, dict):
                     data["full_text"] = ocr_data.get("full_raw_text", "")
