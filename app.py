@@ -47,7 +47,15 @@ def resolve_local_image_path(raw_path: str):
 
 
 def fetch_api_json(path: str, method: str = "GET", **kwargs):
-    response = requests.request(method, f"{API_URL}{path}", timeout=kwargs.pop("timeout", 30), **kwargs)
+    headers = dict(kwargs.pop("headers", {}) or {})
+    token = st.session_state.get("auth_token", "")
+    if token:
+        headers.setdefault("Authorization", f"Bearer {token}")
+
+    response = requests.request(method, f"{API_URL}{path}", timeout=kwargs.pop("timeout", 30), headers=headers, **kwargs)
+    if response.status_code == 401:
+        st.session_state.auth_user = None
+        st.session_state.auth_token = ""
     response.raise_for_status()
     return response.json()
 
@@ -357,7 +365,20 @@ with col2:
                 
                 # Call the FastAPI Endpoint
                 try:
-                    response = requests.post(f"{API_URL}/api/v1/process_document", files=files, data=data_payload, timeout=300)
+                    upload_headers = {}
+                    if st.session_state.get("auth_token"):
+                        upload_headers["Authorization"] = f"Bearer {st.session_state.auth_token}"
+
+                    response = requests.post(
+                        f"{API_URL}/api/v1/process_document",
+                        files=files,
+                        data=data_payload,
+                        headers=upload_headers,
+                        timeout=300,
+                    )
+                    if response.status_code == 401:
+                        st.session_state.auth_user = None
+                        st.session_state.auth_token = ""
                     response.raise_for_status()
                     result = response.json()
                     

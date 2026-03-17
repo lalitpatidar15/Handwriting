@@ -8,21 +8,20 @@ from uuid import uuid4
 from typing import Any
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from database import SessionLocal, engine, Base, ensure_schema_migrations
-import models
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import schemas
 from main import DocumentIntelligenceSystem
 from universal_parser import UniversalDataIntelligence
 from cloud_ocr import cloud_ocr, run_enterprise_idp_pipeline
 from mongo_store import MongoIDPStore
+from env_loader import load_env_file
 import uvicorn
 import cv2
 
-# Initialize DB
-models.Base.metadata.create_all(bind=engine)
-ensure_schema_migrations()
+load_env_file(os.path.join(os.path.dirname(__file__), ".env"))
 
 app = FastAPI(title="DOC-INTEL AI API", version="5.0")
+auth_scheme = HTTPBearer(auto_error=False)
 
 # CORS for external apps/frontend
 app.add_middleware(
@@ -51,13 +50,10 @@ async def load_ai_models():
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# DB Dependency
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+
+def _ensure_mongo_connected() -> None:
+    if not mongo_store.is_connected():
+        raise HTTPException(status_code=503, detail="MongoDB is not connected. Configure MONGODB_URI and restart.")
 
 
 def _normalize_value(value):
@@ -185,39 +181,37 @@ def _fingerprint_similarity(left: dict[str, Any], right: dict[str, Any]) -> floa
     return round((0.40 * anchor_score) + (0.20 * kv_score) + (0.15 * row_score) + (0.10 * column_score) + (0.15 * type_score), 4)
 
 
-def _match_or_create_template(db, data: dict[str, Any], doc_analysis: dict[str, Any], ocr_results: list[Any], filename: str, domain: str):
+def _match_or_create_template(data: dict[str, Any], doc_analysis: dict[str, Any], ocr_results: list[Any], filename: str, domain: str):
     fingerprint = _build_template_fingerprint(data, doc_analysis, ocr_results, filename, domain)
-    candidates = db.query(models.TemplateRecord).filter(
-        models.TemplateRecord.document_type == fingerprint["document_type"],
-        models.TemplateRecord.document_domain == domain,
-    ).all()
+    candidates = mongo_store.list_templates_by_type_domain(fingerprint["document_type"], domain)
 
     best_template = None
     best_score = 0.0
     for candidate in candidates:
-        score = _fingerprint_similarity(fingerprint, candidate.fingerprint or {})
+        score = _fingerprint_similarity(fingerprint, candidate.get("fingerprint", {}) or {})
         if score > best_score:
             best_template = candidate
             best_score = score
 
     if best_template and best_score >= 0.72:
-        best_template.sample_count += 1
-        best_template.last_matched_at = datetime.datetime.utcnow()
-        db.add(best_template)
+        mongo_store.touch_template_match(int(best_template.get("template_id", 0)))
+        best_template = mongo_store.get_template(int(best_template.get("template_id", 0))) or best_template
         return best_template, best_score, fingerprint
 
     template_name = f"{domain}_{fingerprint['document_type'].lower()}_{max(len(candidates) + 1, 1)}"
-    template = models.TemplateRecord(
-        template_name=template_name,
-        tenant_id="default",
-        document_type=fingerprint["document_type"],
-        document_domain=domain,
-        fingerprint=fingerprint,
-        sample_count=1,
-        approval_status="learned",
+    template = mongo_store.create_template(
+        {
+            "template_name": template_name,
+            "tenant_id": "default",
+            "document_type": fingerprint["document_type"],
+            "document_domain": domain,
+            "fingerprint": fingerprint,
+            "sample_count": 1,
+            "approval_status": "learned",
+        }
     )
-    db.add(template)
-    db.flush()
+    if not template:
+        raise HTTPException(status_code=500, detail="Failed to create template in MongoDB")
     return template, 1.0, fingerprint
 
 
@@ -309,50 +303,120 @@ def _apply_correction_to_payload(payload, field_name, corrected_value):
     return payload
 
 
-def _serialize_document(document, db):
-    field_predictions = db.query(models.FieldPrediction).filter(models.FieldPrediction.document_id == document.id).order_by(models.FieldPrediction.id.asc()).all()
-    review_tasks = db.query(models.ReviewTask).filter(models.ReviewTask.document_id == document.id).order_by(models.ReviewTask.status.asc(), models.ReviewTask.id.asc()).all()
-    model_runs = db.query(models.ModelRun).filter(models.ModelRun.document_id == document.id).order_by(models.ModelRun.id.asc()).all()
-    extraction_blocks = db.query(models.ExtractionBlock).filter(models.ExtractionBlock.document_id == document.id).order_by(models.ExtractionBlock.id.asc()).all()
+def _serialize_document(document: dict[str, Any]):
+    document_id = int(document.get("document_id", 0) or 0)
+    field_predictions = mongo_store.list_field_predictions(document_id)
+    review_tasks = mongo_store.list_review_tasks(status="all", limit=10000)
+    review_tasks = [task for task in review_tasks if int(task.get("document_id", 0) or 0) == document_id]
+    model_runs = mongo_store.list_model_runs(document_id)
+    extraction_blocks = mongo_store.list_extraction_blocks(document_id)
     template = None
-    if document.template_id:
-        template = db.query(models.TemplateRecord).filter(models.TemplateRecord.id == document.template_id).first()
+    if document.get("template_id") is not None:
+        template = mongo_store.get_template(int(document.get("template_id") or 0))
 
     return {
-        "id": document.id,
-        "filename": document.filename,
-        "upload_time": document.upload_time,
-        "document_type": document.document_type,
-        "confidence_score": document.confidence_score,
-        "ocr_provider": document.ocr_provider,
-        "layout_provider": document.layout_provider,
-        "reasoning_provider": document.reasoning_provider,
-        "processing_time_ms": document.processing_time_ms,
-        "original_image_path": document.original_image_path,
-        "processed_image_path": document.processed_image_path,
-        "extracted_text": document.extracted_text,
-        "extracted_json": document.extracted_json,
-        "review_status": document.review_status,
-        "schema_version": document.schema_version,
-        "document_domain": document.document_domain,
-        "template_id": document.template_id,
-        "template_match_score": document.template_match_score,
-        "field_predictions": field_predictions,
-        "review_tasks": review_tasks,
-        "model_runs": model_runs,
-        "extraction_blocks": extraction_blocks,
-        "template": template,
+        "id": document_id,
+        "filename": document.get("filename", ""),
+        "upload_time": document.get("upload_time", datetime.datetime.utcnow()),
+        "document_type": document.get("document_type", "UNKNOWN"),
+        "confidence_score": float(document.get("confidence_score", 0.0) or 0.0),
+        "ocr_provider": document.get("ocr_provider", "local"),
+        "layout_provider": document.get("layout_provider", "local"),
+        "reasoning_provider": document.get("reasoning_provider", "local"),
+        "processing_time_ms": float(document.get("processing_time_ms", 0.0) or 0.0),
+        "original_image_path": document.get("original_image_path", ""),
+        "processed_image_path": document.get("processed_image_path"),
+        "extracted_text": document.get("extracted_text"),
+        "extracted_json": document.get("extracted_json"),
+        "review_status": document.get("review_status", "pending_review"),
+        "schema_version": document.get("schema_version", "1.0"),
+        "document_domain": document.get("document_domain", "general"),
+        "template_id": document.get("template_id"),
+        "template_match_score": float(document.get("template_match_score", 0.0) or 0.0),
+        "field_predictions": [
+            {
+                "id": int(item.get("prediction_id", 0) or 0),
+                "document_id": int(item.get("document_id", 0) or 0),
+                "field_name": item.get("field_name", ""),
+                "field_type": item.get("field_type", "text"),
+                "predicted_value": item.get("predicted_value"),
+                "corrected_value": item.get("corrected_value"),
+                "confidence_score": float(item.get("confidence_score", 0.0) or 0.0),
+                "source_engine": item.get("source_engine", "local"),
+                "review_status": item.get("review_status", "pending_review"),
+                "created_at": item.get("created_at", datetime.datetime.utcnow()),
+                "updated_at": item.get("updated_at", datetime.datetime.utcnow()),
+            }
+            for item in field_predictions
+        ],
+        "review_tasks": [
+            {
+                "id": int(item.get("task_id", 0) or 0),
+                "document_id": int(item.get("document_id", 0) or 0),
+                "field_prediction_id": int(item.get("field_prediction_id", 0) or 0),
+                "status": item.get("status", "open"),
+                "priority": item.get("priority", "medium"),
+                "predicted_value": item.get("predicted_value"),
+                "corrected_value": item.get("corrected_value"),
+                "reviewer_name": item.get("reviewer_name"),
+                "review_notes": item.get("review_notes"),
+                "created_at": item.get("created_at", datetime.datetime.utcnow()),
+                "completed_at": item.get("completed_at"),
+            }
+            for item in review_tasks
+        ],
+        "model_runs": [
+            {
+                "id": int(item.get("run_id", 0) or 0),
+                "document_id": int(item.get("document_id", 0) or 0),
+                "stage": item.get("stage", ""),
+                "model_name": item.get("model_name", ""),
+                "provider": item.get("provider", "local"),
+                "success": item.get("success", "true"),
+                "duration_ms": float(item.get("duration_ms", 0.0) or 0.0),
+                "raw_output": item.get("raw_output"),
+                "created_at": item.get("created_at", datetime.datetime.utcnow()),
+            }
+            for item in model_runs
+        ],
+        "extraction_blocks": [
+            {
+                "id": int(item.get("block_id", 0) or 0),
+                "document_id": int(item.get("document_id", 0) or 0),
+                "page_number": int(item.get("page_number", 1) or 1),
+                "block_type": item.get("block_type", "word"),
+                "text": item.get("text"),
+                "bbox": item.get("bbox"),
+                "confidence_score": float(item.get("confidence_score", 0.0) or 0.0),
+                "source_engine": item.get("source_engine", "local"),
+                "created_at": item.get("created_at", datetime.datetime.utcnow()),
+            }
+            for item in extraction_blocks
+        ],
+        "template": (
+            {
+                "id": int(template.get("template_id", 0) or 0),
+                "template_name": template.get("template_name", ""),
+                "tenant_id": template.get("tenant_id", "default"),
+                "document_type": template.get("document_type", "UNKNOWN"),
+                "document_domain": template.get("document_domain", "general"),
+                "fingerprint": template.get("fingerprint", {}),
+                "sample_count": int(template.get("sample_count", 1) or 1),
+                "approval_status": template.get("approval_status", "learned"),
+                "last_matched_at": template.get("last_matched_at", datetime.datetime.utcnow()),
+                "created_at": template.get("created_at", datetime.datetime.utcnow()),
+            }
+            if template
+            else None
+        ),
     }
 
 
-def _update_document_review_status(document, db):
-    db.flush()
-    open_tasks = db.query(models.ReviewTask).filter(
-        models.ReviewTask.document_id == document.id,
-        models.ReviewTask.status == "open",
-    ).count()
-    document.review_status = "review_required" if open_tasks else "approved"
-    db.add(document)
+def _update_document_review_status(document_id: int) -> str:
+    open_tasks = mongo_store.count_open_review_tasks(document_id)
+    review_status = "review_required" if open_tasks else "approved"
+    mongo_store.update_document(document_id, {"review_status": review_status})
+    return review_status
 
 
 def _password_salt() -> str:
@@ -373,13 +437,52 @@ def _build_auth_token(user_id: int, email: str) -> str:
     signature = hashlib.sha256(f"{payload}:{_password_salt()}".encode("utf-8")).hexdigest()
     return base64.urlsafe_b64encode(f"{payload}:{signature}".encode("utf-8")).decode("utf-8")
 
+
+def _decode_auth_token(token: str) -> dict[str, Any]:
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode("utf-8")).decode("utf-8")
+        user_id_text, email, issued_at_text, signature = decoded.split(":", 3)
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail=f"Invalid auth token format: {exc}")
+
+    payload = f"{user_id_text}:{email}:{issued_at_text}"
+    expected_signature = hashlib.sha256(f"{payload}:{_password_salt()}".encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(expected_signature, signature):
+        raise HTTPException(status_code=401, detail="Invalid auth token signature")
+
+    issued_at = int(issued_at_text)
+    max_age_seconds = int(os.getenv("AUTH_TOKEN_MAX_AGE_SECONDS", str(7 * 24 * 60 * 60)))
+    if int(time.time()) - issued_at > max_age_seconds:
+        raise HTTPException(status_code=401, detail="Auth token expired")
+
+    return {
+        "user_id": int(user_id_text),
+        "email": email,
+        "issued_at": issued_at,
+    }
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(auth_scheme),
+):
+    _ensure_mongo_connected()
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    token_data = _decode_auth_token(credentials.credentials)
+    user = mongo_store.find_user_by_id(int(token_data["user_id"]))
+    if not user or str(user.get("email", "")).lower() != str(token_data["email"]).lower():
+        raise HTTPException(status_code=401, detail="Authenticated user not found")
+    return user
+
 @app.get("/")
 def read_root():
     return {"status": "DOC-INTEL API is running", "version": "5.0"}
 
 
 @app.post("/api/v1/auth/signup", response_model=schemas.AuthResponse)
-def signup(payload: schemas.SignupRequest, db=Depends(get_db)):
+def signup(payload: schemas.SignupRequest):
+    _ensure_mongo_connected()
     username = payload.username.strip()
     email = payload.email.strip().lower()
     password = payload.password.strip()
@@ -391,24 +494,16 @@ def signup(payload: schemas.SignupRequest, db=Depends(get_db)):
     if len(password) < 6:
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
 
-    existing = db.query(models.UserAccount).filter(
-        (models.UserAccount.email == email) | (models.UserAccount.username == username)
-    ).first()
-    if existing:
+    if mongo_store.user_exists_by_email_or_username(email=email, username=username):
         raise HTTPException(status_code=409, detail="User with this email or username already exists")
 
-    user = models.UserAccount(
-        username=username,
-        email=email,
-        password_hash=_hash_password(password),
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+    user = mongo_store.create_user(username=username, email=email, password_hash=_hash_password(password))
+    if not user:
+        raise HTTPException(status_code=500, detail="Unable to create user in MongoDB")
 
-    user_id = int(getattr(user, "id"))
-    user_name = str(getattr(user, "username"))
-    user_email = str(getattr(user, "email"))
+    user_id = int(user.get("user_id", 0) or 0)
+    user_name = str(user.get("username", ""))
+    user_email = str(user.get("email", ""))
 
     return schemas.AuthResponse(
         status="success",
@@ -420,17 +515,18 @@ def signup(payload: schemas.SignupRequest, db=Depends(get_db)):
 
 
 @app.post("/api/v1/auth/login", response_model=schemas.AuthResponse)
-def login(payload: schemas.LoginRequest, db=Depends(get_db)):
+def login(payload: schemas.LoginRequest):
+    _ensure_mongo_connected()
     email = payload.email.strip().lower()
     password = payload.password.strip()
 
-    user = db.query(models.UserAccount).filter(models.UserAccount.email == email).first()
-    if not user or not _verify_password(password, user.password_hash):
+    user = mongo_store.find_user_by_email(email)
+    if not user or not _verify_password(password, str(user.get("password_hash", ""))):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    user_id = int(getattr(user, "id"))
-    user_name = str(getattr(user, "username"))
-    user_email = str(getattr(user, "email"))
+    user_id = int(user.get("user_id", 0) or 0)
+    user_name = str(user.get("username", ""))
+    user_email = str(user.get("email", ""))
 
     return schemas.AuthResponse(
         status="success",
@@ -439,6 +535,16 @@ def login(payload: schemas.LoginRequest, db=Depends(get_db)):
         email=user_email,
         token=_build_auth_token(user_id, user_email),
     )
+
+
+@app.get("/api/v1/auth/me")
+def auth_me(current_user=Depends(get_current_user)):
+    return {
+        "status": "success",
+        "user_id": int(current_user.get("user_id", 0) or 0),
+        "username": str(current_user.get("username", "")),
+        "email": str(current_user.get("email", "")),
+    }
 
 
 @app.get("/api/v1/providers/requirements")
@@ -513,7 +619,7 @@ def get_mongo_health():
 
 
 @app.get("/api/v1/mongo/documents/{document_id}")
-def get_mongo_document(document_id: int):
+def get_mongo_document(document_id: int, current_user=Depends(get_current_user)):
     record = mongo_store.get_document_bundle(document_id)
     if not record:
         raise HTTPException(status_code=404, detail="Mongo document bundle not found")
@@ -521,7 +627,7 @@ def get_mongo_document(document_id: int):
 
 
 @app.post("/api/v1/mongo/vector/search")
-def mongo_vector_search(payload: dict[str, Any]):
+def mongo_vector_search(payload: dict[str, Any], current_user=Depends(get_current_user)):
     query_vector = payload.get("query_vector")
     if not isinstance(query_vector, list) or not query_vector:
         raise HTTPException(status_code=400, detail="query_vector must be a non-empty float array")
@@ -551,8 +657,9 @@ async def process_document_async_enqueue(
     file: UploadFile = File(...),
     enterprise_ocr_provider: str = Form("documentai"),
     enterprise_reasoning_provider: str = Form("gemini"),
-    db=Depends(get_db),
+    current_user=Depends(get_current_user),
 ):
+    _ensure_mongo_connected()
     try:
         from workers.document_tasks import process_document_async
     except Exception as exc:
@@ -567,49 +674,50 @@ async def process_document_async_enqueue(
     with open(file_path, "wb") as buffer:
         buffer.write(file_contents)
 
-    new_record = models.DocumentRecord(
-        filename=filename,
-        document_type="QUEUED",
-        confidence_score=0.0,
-        original_image_path=file_path,
-        processed_image_path=file_path,
-        extracted_text="",
-        extracted_json={"status": "queued"},
-        ocr_provider="queued",
-        processing_time_ms=0.0,
-        review_status="queued",
-        schema_version="1.0",
-        document_domain="general",
-        template_match_score=0.0,
-        layout_provider=enterprise_ocr_provider,
-        reasoning_provider=enterprise_reasoning_provider,
+    new_record = mongo_store.create_document(
+        {
+            "filename": filename,
+            "document_type": "QUEUED",
+            "confidence_score": 0.0,
+            "original_image_path": file_path,
+            "processed_image_path": file_path,
+            "extracted_text": "",
+            "extracted_json": {"status": "queued"},
+            "ocr_provider": "queued",
+            "processing_time_ms": 0.0,
+            "review_status": "queued",
+            "schema_version": "1.0",
+            "document_domain": "general",
+            "template_match_score": 0.0,
+            "layout_provider": enterprise_ocr_provider,
+            "reasoning_provider": enterprise_reasoning_provider,
+        }
     )
-    db.add(new_record)
-    db.flush()
+    if not new_record:
+        raise HTTPException(status_code=500, detail="Failed to create queued document in MongoDB")
 
-    task = process_document_async.delay(new_record.id)
+    record_id = int(new_record.get("document_id", 0) or 0)
+    task = process_document_async.delay(record_id)
 
-    db.add(
-        models.ModelRun(
-            document_id=new_record.id,
-            stage="async_queue",
-            model_name="celery_enqueue",
-            provider="celery",
-            success="true",
-            duration_ms=0.0,
-            raw_output={
+    mongo_store.create_model_run(
+        {
+            "document_id": record_id,
+            "stage": "async_queue",
+            "model_name": "celery_enqueue",
+            "provider": "celery",
+            "success": "true",
+            "duration_ms": 0.0,
+            "raw_output": {
                 "task_id": task.id,
                 "layout_provider": enterprise_ocr_provider,
                 "reasoning_provider": enterprise_reasoning_provider,
             },
-        )
+        }
     )
-
-    db.commit()
 
     return {
         "status": "queued",
-        "record_id": new_record.id,
+        "record_id": record_id,
         "task_id": task.id,
         "layout_provider": enterprise_ocr_provider,
         "reasoning_provider": enterprise_reasoning_provider,
@@ -625,11 +733,12 @@ async def process_document(
     enterprise_reasoning_provider: str = Form("gemini"),
     force_mode: str = Form(None), # None, 'HANDWRITTEN_NOTE', or 'STRUCTURED_FORM'
     high_fidelity: bool = Form(True),
-    db=Depends(get_db)
+    current_user=Depends(get_current_user),
 ):
     """
     Enterprise Endpoint: Uploads file, locally saves it securely, processes via Vision + OCR + AI, and stores in DB.
     """
+    _ensure_mongo_connected()
     try:
         started_at = time.perf_counter()
         model_runs = []
@@ -792,7 +901,6 @@ async def process_document(
         processing_time_ms = round((time.perf_counter() - started_at) * 1000, 2)
 
         template, template_match_score, template_fingerprint = _match_or_create_template(
-            db,
             data,
             doc_analysis,
             ocr_results,
@@ -806,110 +914,120 @@ async def process_document(
             "success": "true",
             "duration_ms": 0.0,
             "raw_output": {
-                "template_id": template.id,
-                "template_name": template.template_name,
+                "template_id": template.get("template_id"),
+                "template_name": template.get("template_name"),
                 "template_match_score": template_match_score,
                 "fingerprint": template_fingerprint,
             },
         })
 
         # 4. Save to Enterprise Database
-        new_record = models.DocumentRecord(
-            filename=filename,
-            document_type=doc_analysis.get("type", "UNKNOWN"),
-            confidence_score=doc_analysis.get('confidence_score', 0.0),
-            original_image_path=file_path,
-            processed_image_path=processed_path,
-            extracted_text=data.get("full_text", ""),
-            extracted_json=data,
-            ocr_provider=source_engine,
-            processing_time_ms=processing_time_ms,
-            review_status="review_required" if open_review_count else "approved",
-            schema_version="1.0",
-            document_domain=document_domain,
-            template_id=template.id,
-            template_match_score=template_match_score,
-            layout_provider=enterprise_ocr_provider if enterprise_mode else source_engine,
-            reasoning_provider=enterprise_reasoning_provider if enterprise_mode else (provider if cloud_mode else "local"),
+        new_record = mongo_store.create_document(
+            {
+                "filename": filename,
+                "document_type": doc_analysis.get("type", "UNKNOWN"),
+                "confidence_score": doc_analysis.get("confidence_score", 0.0),
+                "original_image_path": file_path,
+                "processed_image_path": processed_path,
+                "extracted_text": data.get("full_text", ""),
+                "extracted_json": data,
+                "ocr_provider": source_engine,
+                "processing_time_ms": processing_time_ms,
+                "review_status": "review_required" if open_review_count else "approved",
+                "schema_version": "1.0",
+                "document_domain": document_domain,
+                "template_id": int(template.get("template_id", 0) or 0),
+                "template_match_score": template_match_score,
+                "layout_provider": enterprise_ocr_provider if enterprise_mode else source_engine,
+                "reasoning_provider": enterprise_reasoning_provider if enterprise_mode else (provider if cloud_mode else "local"),
+            }
         )
-        db.add(new_record)
-        db.flush()
+        if not new_record:
+            raise HTTPException(status_code=500, detail="Failed to persist document in MongoDB")
+
+        record_id = int(new_record.get("document_id", 0) or 0)
 
         for block in extraction_blocks:
-            db.add(models.ExtractionBlock(
-                document_id=new_record.id,
-                page_number=block["page_number"],
-                block_type=block["block_type"],
-                text=block["text"],
-                bbox=block["bbox"],
-                confidence_score=block["confidence_score"],
-                source_engine=block["source_engine"],
-            ))
+            mongo_store.create_extraction_block(
+                {
+                    "document_id": record_id,
+                    "page_number": block["page_number"],
+                    "block_type": block["block_type"],
+                    "text": block["text"],
+                    "bbox": block["bbox"],
+                    "confidence_score": block["confidence_score"],
+                    "source_engine": block["source_engine"],
+                }
+            )
 
         saved_predictions = []
         for prediction in field_predictions:
             prediction_review_status = _review_status_for_confidence(prediction["confidence_score"])
-            saved_prediction = models.FieldPrediction(
-                document_id=new_record.id,
-                field_name=prediction["field_name"],
-                field_type=prediction["field_type"],
-                predicted_value=prediction["predicted_value"],
-                confidence_score=prediction["confidence_score"],
-                source_engine=prediction["source_engine"],
-                review_status=prediction_review_status,
+            saved_prediction = mongo_store.create_field_prediction(
+                {
+                    "document_id": record_id,
+                    "field_name": prediction["field_name"],
+                    "field_type": prediction["field_type"],
+                    "predicted_value": prediction["predicted_value"],
+                    "confidence_score": prediction["confidence_score"],
+                    "source_engine": prediction["source_engine"],
+                    "review_status": prediction_review_status,
+                }
             )
-            db.add(saved_prediction)
-            db.flush()
+            if not saved_prediction:
+                continue
             saved_predictions.append(saved_prediction)
 
             if prediction_review_status != "auto_approved":
-                db.add(models.ReviewTask(
-                    document_id=new_record.id,
-                    field_prediction_id=saved_prediction.id,
-                    status="open",
-                    priority=_review_priority(saved_prediction.confidence_score),
-                    predicted_value=saved_prediction.predicted_value,
-                ))
+                mongo_store.create_review_task(
+                    {
+                        "document_id": record_id,
+                        "field_prediction_id": int(saved_prediction.get("prediction_id", 0) or 0),
+                        "status": "open",
+                        "priority": _review_priority(float(saved_prediction.get("confidence_score", 0.0) or 0.0)),
+                        "predicted_value": saved_prediction.get("predicted_value"),
+                    }
+                )
 
         for run in model_runs:
-            db.add(models.ModelRun(
-                document_id=new_record.id,
-                stage=run["stage"],
-                model_name=run["model_name"],
-                provider=run["provider"],
-                success=run["success"],
-                duration_ms=run["duration_ms"],
-                raw_output=run["raw_output"],
-            ))
+            mongo_store.create_model_run(
+                {
+                    "document_id": record_id,
+                    "stage": run["stage"],
+                    "model_name": run["model_name"],
+                    "provider": run["provider"],
+                    "success": run["success"],
+                    "duration_ms": run["duration_ms"],
+                    "raw_output": run["raw_output"],
+                }
+            )
 
-        db.commit()
-        db.refresh(new_record)
-        print(f"✅ Record #{new_record.id} saved to DB.")
+        print(f"✅ Record #{record_id} saved to MongoDB.")
 
         mongo_store.upsert_document_bundle(
-            document_id=new_record.id,
+            document_id=record_id,
             file_path=file_path,
             processed_path=processed_path,
             document_type=str(doc_analysis.get("type", "UNKNOWN") or "UNKNOWN"),
-            status=str(new_record.review_status or "processed"),
+            status=str(new_record.get("review_status", "processed") or "processed"),
             confidence_score=float(doc_analysis.get("confidence_score", 0.0) or 0.0),
             domain=document_domain,
             source_engine=source_engine,
             extracted_data=data,
             field_predictions=[
                 {
-                    "name": item.field_name,
-                    "value": item.predicted_value,
-                    "confidence": item.confidence_score,
-                    "review_status": item.review_status,
+                    "name": item.get("field_name"),
+                    "value": item.get("predicted_value"),
+                    "confidence": item.get("confidence_score"),
+                    "review_status": item.get("review_status"),
                 }
                 for item in saved_predictions
             ],
             model_runs=model_runs,
             template_payload={
-                "template_id": template.id,
-                "template_name": template.template_name,
-                "document_domain": template.document_domain,
+                "template_id": template.get("template_id"),
+                "template_name": template.get("template_name"),
+                "document_domain": template.get("document_domain"),
                 "match_score": template_match_score,
                 "fingerprint": template_fingerprint,
             },
@@ -918,35 +1036,35 @@ async def process_document(
         # 5. Return JSON to Client
         return {
             "status": "success",
-            "record_id": new_record.id,
+            "record_id": record_id,
             "analysis": doc_analysis,
             "structured_data": data,
             "field_predictions": [
                 {
-                    "id": item.id,
-                    "field_name": item.field_name,
-                    "field_type": item.field_type,
-                    "predicted_value": item.predicted_value,
-                    "confidence_score": item.confidence_score,
-                    "review_status": item.review_status,
+                    "id": int(item.get("prediction_id", 0) or 0),
+                    "field_name": item.get("field_name", ""),
+                    "field_type": item.get("field_type", "text"),
+                    "predicted_value": item.get("predicted_value"),
+                    "confidence_score": float(item.get("confidence_score", 0.0) or 0.0),
+                    "review_status": item.get("review_status", "pending_review"),
                 }
                 for item in saved_predictions
             ],
             "review_summary": {
-                "document_review_status": new_record.review_status,
+                "document_review_status": new_record.get("review_status", "pending_review"),
                 "open_tasks": open_review_count,
                 "auto_approved_fields": len(field_predictions) - open_review_count,
             },
             "pipeline": {
                 "enterprise_mode": enterprise_mode,
                 "cloud_mode": cloud_mode,
-                "layout_provider": new_record.layout_provider,
-                "reasoning_provider": new_record.reasoning_provider,
+                "layout_provider": new_record.get("layout_provider", "local"),
+                "reasoning_provider": new_record.get("reasoning_provider", "local"),
             },
             "template": {
-                "id": template.id,
-                "template_name": template.template_name,
-                "document_domain": template.document_domain,
+                "id": int(template.get("template_id", 0) or 0),
+                "template_name": template.get("template_name", ""),
+                "document_domain": template.get("document_domain", "general"),
                 "match_score": template_match_score,
             },
             "layout_summary": {
@@ -959,77 +1077,138 @@ async def process_document(
             }
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/v1/history")
-def get_history(limit: int = 50, db=Depends(get_db)):
-    """Retrieve document history from the database."""
-    records = db.query(models.DocumentRecord).order_by(models.DocumentRecord.id.desc()).limit(limit).all()
-    return records
+def get_history(limit: int = 50, current_user=Depends(get_current_user)):
+    """Retrieve document history from MongoDB."""
+    _ensure_mongo_connected()
+    records = mongo_store.list_documents(limit=limit)
+    response = []
+    for record in records:
+        response.append(
+            {
+                "id": int(record.get("document_id", 0) or 0),
+                "filename": record.get("filename", ""),
+                "upload_time": record.get("upload_time", datetime.datetime.utcnow()),
+                "document_type": record.get("document_type", "UNKNOWN"),
+                "confidence_score": float(record.get("confidence_score", 0.0) or 0.0),
+                "ocr_provider": record.get("ocr_provider", "local"),
+                "layout_provider": record.get("layout_provider", "local"),
+                "reasoning_provider": record.get("reasoning_provider", "local"),
+                "processing_time_ms": float(record.get("processing_time_ms", 0.0) or 0.0),
+                "extracted_text": record.get("extracted_text"),
+                "extracted_json": record.get("extracted_json"),
+                "review_status": record.get("review_status", "pending_review"),
+                "schema_version": record.get("schema_version", "1.0"),
+                "document_domain": record.get("document_domain", "general"),
+                "template_id": record.get("template_id"),
+                "template_match_score": float(record.get("template_match_score", 0.0) or 0.0),
+            }
+        )
+    return response
 
 
 @app.get("/api/v1/documents/{document_id}", response_model=schemas.DocumentDetailResponse)
-def get_document_detail(document_id: int, db=Depends(get_db)):
-    document = db.query(models.DocumentRecord).filter(models.DocumentRecord.id == document_id).first()
+def get_document_detail(document_id: int, current_user=Depends(get_current_user)):
+    _ensure_mongo_connected()
+    document = mongo_store.get_document(document_id)
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
-    return _serialize_document(document, db)
+    return _serialize_document(document)
 
 
 @app.get("/api/v1/review/tasks", response_model=list[schemas.ReviewTaskResponse])
-def get_review_tasks(status: str = "open", limit: int = 50, db=Depends(get_db)):
-    query = db.query(models.ReviewTask)
-    if status != "all":
-        query = query.filter(models.ReviewTask.status == status)
-    tasks = query.order_by(models.ReviewTask.created_at.desc()).limit(limit).all()
-    return tasks
+def get_review_tasks(status: str = "open", limit: int = 50, current_user=Depends(get_current_user)):
+    _ensure_mongo_connected()
+    tasks = mongo_store.list_review_tasks(status=status, limit=limit)
+    return [
+        {
+            "id": int(item.get("task_id", 0) or 0),
+            "document_id": int(item.get("document_id", 0) or 0),
+            "field_prediction_id": int(item.get("field_prediction_id", 0) or 0),
+            "status": item.get("status", "open"),
+            "priority": item.get("priority", "medium"),
+            "predicted_value": item.get("predicted_value"),
+            "corrected_value": item.get("corrected_value"),
+            "reviewer_name": item.get("reviewer_name"),
+            "review_notes": item.get("review_notes"),
+            "created_at": item.get("created_at", datetime.datetime.utcnow()),
+            "completed_at": item.get("completed_at"),
+        }
+        for item in tasks
+    ]
 
 
 @app.get("/api/v1/templates", response_model=list[schemas.TemplateResponse])
-def get_templates(limit: int = 50, db=Depends(get_db)):
-    templates = db.query(models.TemplateRecord).order_by(models.TemplateRecord.last_matched_at.desc()).limit(limit).all()
-    return templates
+def get_templates(limit: int = 50, current_user=Depends(get_current_user)):
+    _ensure_mongo_connected()
+    templates = mongo_store.list_templates(limit=limit)
+    return [
+        {
+            "id": int(item.get("template_id", 0) or 0),
+            "template_name": item.get("template_name", ""),
+            "tenant_id": item.get("tenant_id", "default"),
+            "document_type": item.get("document_type", "UNKNOWN"),
+            "document_domain": item.get("document_domain", "general"),
+            "fingerprint": item.get("fingerprint", {}),
+            "sample_count": int(item.get("sample_count", 1) or 1),
+            "approval_status": item.get("approval_status", "learned"),
+            "last_matched_at": item.get("last_matched_at", datetime.datetime.utcnow()),
+            "created_at": item.get("created_at", datetime.datetime.utcnow()),
+        }
+        for item in templates
+    ]
 
 
 @app.post("/api/v1/review/tasks/{task_id}/complete")
-def complete_review_task(task_id: int, payload: schemas.ReviewTaskCompleteRequest, db=Depends(get_db)):
-    task = db.query(models.ReviewTask).filter(models.ReviewTask.id == task_id).first()
+def complete_review_task(task_id: int, payload: schemas.ReviewTaskCompleteRequest, current_user=Depends(get_current_user)):
+    _ensure_mongo_connected()
+    task = mongo_store.get_review_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Review task not found")
 
-    prediction = db.query(models.FieldPrediction).filter(models.FieldPrediction.id == task.field_prediction_id).first()
-    document = db.query(models.DocumentRecord).filter(models.DocumentRecord.id == task.document_id).first()
+    prediction = mongo_store.get_field_prediction(int(task.get("field_prediction_id", 0) or 0))
+    document = mongo_store.get_document(int(task.get("document_id", 0) or 0))
     if not prediction or not document:
         raise HTTPException(status_code=404, detail="Review task is linked to missing records")
 
-    final_value = payload.corrected_value if payload.corrected_value is not None else prediction.predicted_value
-    task.corrected_value = final_value
-    task.reviewer_name = payload.reviewer_name
-    task.review_notes = payload.review_notes
-    task.status = "completed"
-    task.completed_at = datetime.datetime.utcnow()
+    final_value = payload.corrected_value if payload.corrected_value is not None else prediction.get("predicted_value")
+    mongo_store.update_review_task(
+        task_id,
+        {
+            "corrected_value": final_value,
+            "reviewer_name": payload.reviewer_name,
+            "review_notes": payload.review_notes,
+            "status": "completed",
+            "completed_at": datetime.datetime.utcnow(),
+        },
+    )
 
-    prediction.corrected_value = final_value
-    prediction.review_status = "approved" if payload.resolution == "approved" else "corrected"
+    mongo_store.update_field_prediction(
+        int(prediction.get("prediction_id", 0) or 0),
+        {
+            "corrected_value": final_value,
+            "review_status": "approved" if payload.resolution == "approved" else "corrected",
+        },
+    )
 
-    if document.extracted_json is None:
-        document.extracted_json = {}
-    document.extracted_json = _apply_correction_to_payload(document.extracted_json, prediction.field_name, final_value)
-    if prediction.field_name == "full_text":
-        document.extracted_text = final_value
+    extracted_json = document.get("extracted_json", {}) or {}
+    updated_payload = _apply_correction_to_payload(extracted_json, str(prediction.get("field_name", "")), final_value)
+    document_update: dict[str, Any] = {"extracted_json": updated_payload}
+    if str(prediction.get("field_name", "")) == "full_text":
+        document_update["extracted_text"] = final_value
+    mongo_store.update_document(int(document.get("document_id", 0) or 0), document_update)
 
-    db.flush()
-    _update_document_review_status(document, db)
-    db.add(task)
-    db.add(prediction)
-    db.add(document)
-    db.commit()
+    new_review_status = _update_document_review_status(int(document.get("document_id", 0) or 0))
 
     mongo_store.save_review_correction(
-        document_id=document.id,
-        field_name=prediction.field_name,
-        predicted_value=str(prediction.predicted_value or ""),
+        document_id=int(document.get("document_id", 0) or 0),
+        field_name=str(prediction.get("field_name", "")),
+        predicted_value=str(prediction.get("predicted_value") or ""),
         corrected_value=str(final_value or ""),
         reviewer_name=payload.reviewer_name,
         review_notes=payload.review_notes,
@@ -1037,10 +1216,10 @@ def complete_review_task(task_id: int, payload: schemas.ReviewTaskCompleteReques
 
     return {
         "status": "success",
-        "task_id": task.id,
-        "document_id": document.id,
-        "document_review_status": document.review_status,
-        "field_name": prediction.field_name,
+        "task_id": int(task.get("task_id", 0) or 0),
+        "document_id": int(document.get("document_id", 0) or 0),
+        "document_review_status": new_review_status,
+        "field_name": str(prediction.get("field_name", "")),
         "final_value": final_value,
     }
 
