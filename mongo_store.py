@@ -1,6 +1,7 @@
 import datetime
 import hashlib
 import os
+import time
 from typing import Any, Optional
 
 try:
@@ -22,6 +23,10 @@ class MongoIDPStore:
         self.enabled = bool(uri and MongoClient is not None)
         self._client = None
         self._db = None
+        # Cache the last successful ping time so we don't ping MongoDB on
+        # every single API request.  A re-check is done at most every 30 s.
+        self._last_ping_ok: bool = False
+        self._last_ping_time: float = 0.0
 
     @classmethod
     def from_env(cls) -> "MongoIDPStore":
@@ -88,8 +93,20 @@ class MongoIDPStore:
         return int(current.get("value", 1))
 
     def is_connected(self) -> bool:
+        """Return True if MongoDB is reachable.
+
+        The result is cached for up to 30 seconds so that ordinary API
+        requests do not incur an extra network round-trip for every call.
+        """
+        _CACHE_TTL_SECONDS = 30.0
+        now = time.monotonic()
+        if self._last_ping_ok and (now - self._last_ping_time) < _CACHE_TTL_SECONDS:
+            return True
         health = self.health()
-        return bool(health.get("enabled") and health.get("connected"))
+        connected = bool(health.get("enabled") and health.get("connected"))
+        self._last_ping_ok = connected
+        self._last_ping_time = now
+        return connected
 
     def create_user(self, username: str, email: str, password_hash: str) -> Optional[dict[str, Any]]:
         if not self.enabled:

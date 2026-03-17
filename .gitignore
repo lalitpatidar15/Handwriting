@@ -17,5 +17,8 @@ vanguard_debug.jpg
 *.csv
 *.xlsx
 
+# SQLite databases
+*.db
+
 # Environment variables
 .env

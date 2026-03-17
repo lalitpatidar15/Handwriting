@@ -53,7 +53,14 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 def _ensure_mongo_connected() -> None:
     if not mongo_store.is_connected():
-        raise HTTPException(status_code=503, detail="MongoDB is not connected. Configure MONGODB_URI and restart.")
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "MongoDB is not connected. "
+                "Set the MONGODB_URI environment variable (see .env.example) "
+                "and restart the server."
+            ),
+        )
 
 
 def _normalize_value(value):
