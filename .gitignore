@@ -22,3 +22,8 @@ vanguard_debug.jpg
 
 # Environment variables
 .env
+
+# Google service account credentials (never commit these)
+google-credentials.json
+*-credentials.json
+service-account*.json

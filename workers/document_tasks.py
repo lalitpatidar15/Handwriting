@@ -37,7 +37,7 @@ def _save_async_result(document_id: int, pipeline_output: dict[str, Any]) -> Non
     )
 
 
-@celery_app.task(name="workers.process_document_async")
+@celery_app.task(name="workers.process_document_async", ignore_result=True)
 def process_document_async(document_id: int) -> dict[str, Any]:
     if not mongo_store.is_connected():
         return {"status": "error", "document_id": document_id, "error": "MongoDB is not connected"}

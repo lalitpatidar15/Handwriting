@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import base64
 from uuid import uuid4
-from typing import Any
+from typing import Any, Optional
 from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -17,6 +17,7 @@ from mongo_store import MongoIDPStore
 from env_loader import load_env_file
 import uvicorn
 import cv2
+from PIL import Image, ImageDraw, ImageFont
 
 load_env_file(os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -46,6 +47,15 @@ async def load_ai_models():
     system, intelligence = await asyncio.to_thread(DocumentIntelligenceSystem), await asyncio.to_thread(UniversalDataIntelligence)
     print("✅ AI Engines Ready.")
 
+    # Check MongoDB connectivity at startup so issues are visible in logs immediately
+    mongo_health = mongo_store.health()
+    if mongo_health.get("connected"):
+        print(f"✅ MongoDB connected — database: '{mongo_health.get('database')}'")
+    else:
+        mongo_err = mongo_health.get("error", "unknown error")
+        print(f"⚠️  MongoDB NOT connected: {mongo_err}")
+        print("   → Documents will not be persisted until MongoDB is reachable.")
+
 # Create permanent upload storage directory (Local S3 equivalent)
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -53,13 +63,10 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 def _ensure_mongo_connected() -> None:
     if not mongo_store.is_connected():
+        error = getattr(mongo_store, "_last_error", None) or "Check MONGODB_URI in .env and ensure your IP is whitelisted in MongoDB Atlas."
         raise HTTPException(
             status_code=503,
-            detail=(
-                "MongoDB is not connected. "
-                "Set the MONGODB_URI environment variable (see .env.example) "
-                "and restart the server."
-            ),
+            detail=f"MongoDB is not connected: {error}",
         )
 
 
@@ -69,6 +76,208 @@ def _normalize_value(value):
     if isinstance(value, (dict, list)):
         return str(value)
     return str(value)
+
+
+def _image_mime_type(file_path: str) -> str:
+    lowered = str(file_path or "").lower()
+    if lowered.endswith(".png"):
+        return "image/png"
+    if lowered.endswith(".webp"):
+        return "image/webp"
+    return "image/jpeg"
+
+
+def _image_file_to_base64(file_path: str) -> Optional[str]:
+    if not file_path or not os.path.exists(file_path):
+        return None
+    with open(file_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode("utf-8")
+
+
+def _structured_lines_from_data(data: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+
+    # Prefer kv pairs that have actual non-null values
+    kv_payload = data.get("kv", {}) or {}
+    if isinstance(kv_payload, dict):
+        for key, value in kv_payload.items():
+            rendered = _normalize_value(value).strip()
+            if rendered:
+                lines.append(f"{key}: {rendered}")
+
+    # Table rows: if every row only has a single "text" key, just emit the text
+    table_payload = data.get("table", []) or []
+    is_text_only_table = table_payload and all(
+        isinstance(r, dict) and list(r.keys()) == ["text"] for r in table_payload
+    )
+    for row in table_payload:
+        if isinstance(row, dict):
+            if is_text_only_table:
+                val = _normalize_value(row.get("text", "")).strip()
+                if val:
+                    lines.append(val)
+            else:
+                row_parts = [
+                    f"{k}: {_normalize_value(v).strip() or '-'}"
+                    for k, v in row.items()
+                    if _normalize_value(v).strip()
+                ]
+                if row_parts:
+                    lines.append("  |  ".join(row_parts))
+        else:
+            val = _normalize_value(row).strip()
+            if val:
+                lines.append(val)
+
+    # Always fall back to full_text if nothing else was extracted
+    if not lines:
+        full_text = str(data.get("full_text", "") or "").strip()
+        for text_line in full_text.splitlines():
+            cleaned = text_line.strip()
+            if cleaned:
+                lines.append(cleaned)
+
+    return lines[:80]
+
+
+def _load_font(size: int) -> ImageFont.ImageFont:
+    """Load a TrueType system font at the given size; fall back to scaled default."""
+    candidates = [
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/SFNS.ttf",
+        "/System/Library/Fonts/Arial.ttf",
+        "/Library/Fonts/Arial Unicode.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    return ImageFont.load_default(size=size)
+
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
+    words = text.split()
+    if not words:
+        return [""]
+
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        candidate = f"{current} {word}"
+        bbox = draw.textbbox((0, 0), candidate, font=font)
+        if (bbox[2] - bbox[0]) <= max_width:
+            current = candidate
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def _render_structured_digital_image(file_stub: str, data: dict[str, Any], doc_analysis: dict[str, Any]) -> Optional[str]:
+    try:
+        width = 1600
+        margin = 72
+        title_font = _load_font(36)
+        meta_font = _load_font(24)
+        body_font = _load_font(26)
+        line_height = 44
+
+        body_lines = _structured_lines_from_data(data)
+        height = max(900, 260 + (len(body_lines) * line_height))
+
+        image = Image.new("RGB", (width, height), color=(250, 251, 253))
+        draw = ImageDraw.Draw(image)
+
+        # Outer card border
+        draw.rounded_rectangle(
+            (24, 24, width - 24, height - 24),
+            radius=20, outline=(200, 210, 225), width=2, fill=(255, 255, 255),
+        )
+
+        # Header bar
+        draw.rectangle((24, 24, width - 24, 110), fill=(30, 41, 59))
+        draw.text((margin, 40), "Digital Document Reconstruction", fill=(255, 255, 255), font=title_font)
+
+        # Meta row
+        doc_type = str(doc_analysis.get("type", "UNKNOWN") or "UNKNOWN")
+        score = float(doc_analysis.get("confidence_score", 0.0) or 0.0)
+        draw.text((margin, 124), f"Type: {doc_type}", fill=(71, 85, 105), font=meta_font)
+        draw.text((margin + 420, 124), f"Confidence: {score * 100:.1f}%", fill=(71, 85, 105), font=meta_font)
+
+        draw.line((margin, 168, width - margin, 168), fill=(226, 232, 240), width=2)
+
+        y = 188
+        content_width = width - (margin * 2)
+        for line in body_lines:
+            # Draw a faint rule behind alternate rows
+            if body_lines.index(line) % 2 == 0:
+                draw.rectangle((margin - 8, y - 4, width - margin + 8, y + line_height - 4), fill=(248, 250, 252))
+            wrapped = _wrap_text(draw, line, body_font, content_width)
+            for wrapped_line in wrapped:
+                draw.text((margin, y), wrapped_line, fill=(17, 24, 39), font=body_font)
+                y += line_height
+            y += 8
+
+        output_path = os.path.abspath(os.path.join(UPLOAD_DIR, f"digital_{file_stub}.png"))
+        image.save(output_path, format="PNG")
+        return output_path
+    except Exception as exc:
+        print(f"⚠️ Digital image render failed: {exc}")
+        return None
+
+
+def _build_digital_output(file_stub: str, source_image_path: str, data: dict[str, Any], doc_analysis: dict[str, Any], ocr_results: list[Any], ocr_engine: Any) -> Optional[dict[str, Any]]:
+    digital_path: Optional[str] = None
+
+    # ── 1. Try Gemini image-generation (best quality) ──────────────────────
+    try:
+        from cloud_ocr import generate_digital_form_image_gemini
+        lines = _structured_lines_from_data(data)
+        extracted_text = "\n".join(lines) if lines else str(data.get("full_text", "") or "")
+        if extracted_text.strip():
+            gemini_out = os.path.abspath(os.path.join(UPLOAD_DIR, f"digital_{file_stub}_gemini.png"))
+            digital_path = generate_digital_form_image_gemini(
+                extracted_text=extracted_text,
+                doc_type=str(doc_analysis.get("type", "UNKNOWN") or "UNKNOWN"),
+                output_path=gemini_out,
+            )
+    except Exception as exc:
+        print(f"⚠️ Gemini image-gen skipped: {exc}")
+
+    # ── 2. Try OpenCV filled-form renderer (good for structured forms) ─────
+    if not digital_path:
+        try:
+            if ocr_engine is not None and (doc_analysis.get("type") == "STRUCTURED_FORM" or data.get("kv") or data.get("table")):
+                render_fn = getattr(ocr_engine, "_generate_filled_form_image", None)
+                if callable(render_fn):
+                    digital_path = render_fn(source_image_path, ocr_results or [])
+        except Exception as exc:
+            print(f"⚠️ Filled form render skipped: {exc}")
+
+    # ── 3. PIL fallback: typed text on clean white canvas ──────────────────
+    if not digital_path:
+        print("[RENDER] Using PIL fallback renderer")
+        digital_path = _render_structured_digital_image(file_stub, data, doc_analysis)
+
+    if digital_path:
+        print(f"[RENDER] Digital output ready: {digital_path}")
+    else:
+        print("[RENDER] ⚠️ All renderers failed, digital_output will be null")
+
+    if not digital_path:
+        return None
+
+    return {
+        "path": digital_path,
+        "mime_type": _image_mime_type(digital_path),
+        "base64": _image_file_to_base64(digital_path),
+    }
 
 
 def _build_field_predictions(data, doc_analysis, source_engine):
@@ -115,6 +324,62 @@ def _build_field_predictions(data, doc_analysis, source_engine):
         })
 
     return predictions
+
+
+def _is_placeholder_secret(value: str) -> bool:
+    lowered = str(value or "").strip().lower()
+    if not lowered:
+        return True
+    placeholder_markers = [
+        "your_",
+        "replace_",
+        "changeme",
+        "example",
+        "dummy",
+    ]
+    return any(marker in lowered for marker in placeholder_markers)
+
+
+def _validate_enterprise_credentials(ocr_provider: str, reasoning_provider: str) -> None:
+    provider = str(ocr_provider or "").strip().lower()
+    reasoning = str(reasoning_provider or "").strip().lower()
+
+    required_by_ocr: dict[str, list[str]] = {
+        "documentai": [
+            "GOOGLE_DOCUMENT_AI_PROJECT_ID",
+            "GOOGLE_DOCUMENT_AI_LOCATION",
+            "GOOGLE_DOCUMENT_AI_PROCESSOR_ID",
+            "GOOGLE_DOCUMENT_AI_API_KEY",
+        ],
+        "textract": [
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_REGION",
+        ],
+        "azure": [
+            "AZURE_DOCINT_ENDPOINT",
+            "AZURE_DOCINT_API_KEY",
+        ],
+    }
+
+    required_keys = list(required_by_ocr.get(provider, []))
+    if reasoning == "gemini":
+        required_keys.append("GEMINI_API_KEY")
+
+    missing_or_placeholder = []
+    for key in required_keys:
+        value = os.getenv(key, "")
+        if _is_placeholder_secret(value):
+            missing_or_placeholder.append(key)
+
+    if missing_or_placeholder:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Enterprise mode requires valid provider credentials. "
+                f"Missing or placeholder values: {', '.join(missing_or_placeholder)}"
+            ),
+        )
 
 
 def _infer_document_domain(data: dict[str, Any], doc_analysis: dict[str, Any], filename: str) -> str:
@@ -615,7 +880,7 @@ def get_provider_health():
             ]
         ),
         "gemini_reasoning": required(["GEMINI_API_KEY"]),
-        "celery": required(["CELERY_BROKER_URL", "CELERY_RESULT_BACKEND"]),
+        "celery": required(["CELERY_BROKER_URL"]),
         "mongodb": mongo_store.health(),
     }
 
@@ -669,8 +934,19 @@ async def process_document_async_enqueue(
     _ensure_mongo_connected()
     try:
         from workers.document_tasks import process_document_async
+        from celery_app import is_celery_broker_available
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Celery worker is not available: {exc}")
+
+    broker_available, broker_error = is_celery_broker_available()
+    if not broker_available:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Async queue is unavailable because the Celery broker is not reachable. "
+                f"Start Redis or update CELERY_BROKER_URL. Root cause: {broker_error}"
+            ),
+        )
 
     filename = file.filename or "upload.jpg"
     file_extension = filename.split(".")[-1] if "." in filename else "jpg"
@@ -704,7 +980,16 @@ async def process_document_async_enqueue(
         raise HTTPException(status_code=500, detail="Failed to create queued document in MongoDB")
 
     record_id = int(new_record.get("document_id", 0) or 0)
-    task = process_document_async.delay(record_id)
+    try:
+        task = process_document_async.apply_async(args=(record_id,), ignore_result=True)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Failed to enqueue async document job. "
+                f"Check Redis / CELERY_BROKER_URL and restart the API if configuration changed. Root cause: {exc}"
+            ),
+        )
 
     mongo_store.create_model_run(
         {
@@ -791,6 +1076,7 @@ async def process_document(
                 f"🏢 Enterprise Mode Activated: OCR={enterprise_ocr_provider.upper()} + "
                 f"REASONING={enterprise_reasoning_provider.upper()}"
             )
+            _validate_enterprise_credentials(enterprise_ocr_provider, enterprise_reasoning_provider)
             enterprise_started_at = time.perf_counter()
             try:
                 enterprise_output = run_enterprise_idp_pipeline(
@@ -826,7 +1112,13 @@ async def process_document(
                     "duration_ms": round((time.perf_counter() - enterprise_started_at) * 1000, 2),
                     "raw_output": {"error": str(e)},
                 })
-                enterprise_mode = False
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "Enterprise pipeline failed and strict enterprise mode is enabled. "
+                        f"Fix provider credentials/config and retry. Root cause: {e}"
+                    ),
+                )
 
         if cloud_mode and not enterprise_mode:
             print(f"☁️ Cloud Mode Activated: Routing to {provider.upper()} API...")
@@ -906,6 +1198,14 @@ async def process_document(
         extraction_blocks = _build_extraction_blocks(data, ocr_results, source_engine)
         open_review_count = sum(1 for item in field_predictions if item["confidence_score"] < 0.92)
         processing_time_ms = round((time.perf_counter() - started_at) * 1000, 2)
+        digital_output = _build_digital_output(
+            file_stub=unique_filename.rsplit(".", 1)[0],
+            source_image_path=processed_path,
+            data=data,
+            doc_analysis=doc_analysis,
+            ocr_results=ocr_results,
+            ocr_engine=ocr_engine,
+        )
 
         template, template_match_score, template_fingerprint = _match_or_create_template(
             data,
@@ -1080,8 +1380,10 @@ async def process_document(
             },
             "paths": {
                 "original": file_path,
-                "processed": processed_path
-            }
+                "processed": processed_path,
+                "digital": digital_output.get("path") if digital_output else None,
+            },
+            "digital_output": digital_output,
         }
 
     except HTTPException:

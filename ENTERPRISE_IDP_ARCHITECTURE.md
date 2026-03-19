@@ -902,3 +902,13 @@ This allows a practical consolidation where MongoDB replaces separate relational
 - Existing SQL tables remain available for compatibility and phased rollout.
 - Mongo mirroring runs after successful document processing and review updates.
 - The current embedding pipeline uses deterministic text vectors as a bootstrap path; replace with model-based embeddings for production-grade semantic retrieval.
+
+### 23.5 Connection Prerequisites
+
+Before the server can reach MongoDB Atlas, two conditions must be met:
+
+1. **IP whitelist**: Your machine's IP must be added to MongoDB Atlas → Network Access → Add IP Address. If the IP is not whitelisted, the connection will fail with an SSL/TLS internal error at the handshake stage — this is how Atlas blocks unauthorized IPs before any authentication is attempted. Use `0.0.0.0/0` for development or your specific IP for production.
+
+2. **pymongo installed**: Run `pip install -r requirements.txt` inside the project virtual environment. The system Python will not have `pymongo`.
+
+If `GET /api/v1/mongo/health` returns `"connected": false`, check these two items first.

@@ -2,7 +2,7 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![OCR](https://img.shields.io/badge/OCR-DocTR%20%7C%20TrOCR-orange)](https://github.com/mindee/doctr)
-[![Framework](https://img.shields.io/badge/Framework-Streamlit-FF4B4B)](https://streamlit.io/)
+[![Framework](https://img.shields.io/badge/Framework-FastAPI-009688)](https://fastapi.tiangolo.com/)
 
 Vanguard Intelligence is an enterprise-grade OCR and Handwriting Recognition system designed for high-accuracy digitization of complex handwritten notes, medical prescriptions, and structured forms. It features a hybrid local-first architecture with optional Cloud Super Mode (Gemini/GPT-4).
 
@@ -18,7 +18,7 @@ For the enterprise target-state architecture and implementation roadmap, see `EN
 
 ## 🛠️ Technology Stack
 
--   **Frontend**: Streamlit (Premium Custom UI)
+-   **Backend API**: FastAPI
 -   **Primary OCR**: `python-doctr` (MobileNet + CRNN)
 -   **Secondary/Refinement OCR**: `transformers` (microsoft/trocr-large)
 -   **Cloud Intelligence**: `google-generativeai`, `openai`
@@ -44,10 +44,16 @@ For the enterprise target-state architecture and implementation roadmap, see `EN
     pip install -r requirements.txt
     ```
 
-4.  **Launch the System**:
+4.  **Launch the API**:
     ```bash
-    streamlit run app.py
+    uvicorn api:app --host 127.0.0.1 --port 8000 --reload
     ```
+
+## Postman Collection
+
+Import the complete API collection from:
+
+- `Handwriting_API.postman_collection.json`
 
 ## ☁️ Cloud Configuration
 
@@ -140,6 +146,8 @@ Async submit endpoint:
     - accepts file upload plus:
         - `enterprise_ocr_provider=documentai|textract|azure`
         - `enterprise_reasoning_provider=gemini`
+
+Note: the async path only needs `CELERY_BROKER_URL`. A Redis result backend is not used.
 
 ## Environment Template
 

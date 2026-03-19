@@ -1,9 +1,17 @@
 import base64
+import asyncio
 import os
 import json
 import re
 import time
-from typing import Any
+import threading
+from typing import Any, Optional
+
+
+def _extract_retry_delay(err_str: str) -> int:
+    """Parse retry_delay seconds from a Gemini quota-exceeded error string."""
+    m = re.search(r'retry_delay\s*\{\s*seconds:\s*(\d+)', err_str)
+    return int(m.group(1)) if m else 0
 
 import requests
 
@@ -28,147 +36,148 @@ def encode_image(image_path):
 
 def cloud_ocr_gemini(image_path):
     """
-    FREE TIER: Google Gemini API for OCR.
-    Free tier: 15 requests/minute, 1500 requests/day
+    Google Gemini Vision OCR via google-genai SDK.
+    Model fallback chain skips per-day quota exhaustion and honours
+    per-minute retry_delay (up to 30 s) before giving up on a model.
     """
-    try:
-        import google.generativeai as genai
-    except ImportError:
-        raise ImportError("Please install: pip install google-generativeai")
-    
-    api_key = os.getenv("GEMINI_API_KEY")
+    from google import genai as gai
+    import PIL.Image
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("GEMINI_API_KEY not found. Get free key from: https://aistudio.google.com/app/apikey")
-    
-    genai.configure(api_key=api_key)  # type: ignore[attr-defined]
-    
-    # Try multiple model names for robustness (Added 2.0/2.5 for peak performance)
-    # The new API key supports 2.0 and 2.5 flash versions
-    model_names = [
-        'gemini-2.5-flash',
-        'gemini-2.0-flash', 
-        'gemini-1.5-flash', 
-        'gemini-1.5-flash-latest'
-    ]
-    last_error = None
-    
-    import PIL.Image
-    img = PIL.Image.open(image_path)
-    prompt = """
-    You are an Enterprise Intelligent Document Processing (IDP) AI. 
-    Analyze this document (handwritten note, form, bill, or prescription) and extract the data strictly as a JSON object.
-    
-    Rules for output:
-    1. Do NOT wrap the JSON in markdown code blocks like ```json ... ```. Just return raw JSON.
-    2. Do NOT add any conversational text, explanations, or greetings.
-    3. Use this exact schema format:
-    {
-      "document_type": "string (e.g., medical_prescription, invoice, handwritten_note, form)",
-      "confidence_score": 0.95,
-      "metadata": {
-        "date": "extracted or null",
-        "patient_or_client_name": "extracted or null"
-      },
-      "extracted_data": [
-        // For tables/bills/prescriptions, put rows here as objects (e.g. {"medicine": "Amox", "dose": "500mg"})
-        // For paragraphs, put paragraphs here as {"text": "..."}
-      ],
-      "full_raw_text": "string containing all the text"
-    }
-    """
 
+    client = gai.Client(api_key=api_key)
+
+    # gemini-2.0-flash has limit:0 on free tier; gemini-1.5-flash-8b is the
+    # most generous free-tier fallback available on the new SDK.
+    model_names = [
+        "gemini-2.5-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-8b",
+    ]
+
+    img = PIL.Image.open(image_path)
+    prompt = (
+        "You are an Enterprise Intelligent Document Processing (IDP) AI. "
+        "Analyze this document (handwritten note, form, bill, or prescription) and extract the data strictly as a JSON object. "
+        "Rules: "
+        "1. Do NOT wrap JSON in markdown code blocks. Just return raw JSON. "
+        "2. Do NOT add any conversational text. "
+        "3. Use this exact schema: "
+        '{"document_type": "string", "confidence_score": 0.95, '
+        '"metadata": {"date": null, "patient_or_client_name": null}, '
+        '"extracted_data": [], "full_raw_text": "string"}'
+    )
+
+    last_error = None
     for model_name in model_names:
+        print(f"[OCR] Trying Gemini model: {model_name}")
         try:
-            print(f"[OCR] Trying Gemini model: {model_name}")
-            model = genai.GenerativeModel(model_name)  # type: ignore[attr-defined]
-            response = model.generate_content([prompt, img])
-            
-            # Clean up potential markdown formatting from Gemini
-            text_response = response.text.strip()
-            if text_response.startswith('```json'):
-                text_response = text_response[7:]
-            if text_response.startswith('```'):
-                text_response = text_response[3:]
-            if text_response.endswith('```'):
-                text_response = text_response[:-3]
-                
-            text_response = text_response.strip()
-            
-            # Verify it's valid JSON
-            try:
-                json_data = json.loads(text_response)
-                return json_data # Return the actual dict/json
-            except json.JSONDecodeError:
-                print(f"[OCR] Gemini {model_name} generated invalid JSON, returning raw text.")
-                return {"full_raw_text": text_response, "document_type": "UNKNOWN"}
-                
+            for attempt in range(2):
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=[prompt, img],
+                    )
+                    text_response = _strip_json_fences((response.text or "").strip())
+                    try:
+                        return json.loads(text_response)
+                    except json.JSONDecodeError:
+                        print(f"[OCR] Gemini {model_name} returned non-JSON, using raw text.")
+                        return {"full_raw_text": text_response, "document_type": "UNKNOWN"}
+                except Exception as inner_exc:
+                    err = str(inner_exc)
+                    if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                        # Per-day quota: skip this model immediately
+                        if "PerDay" in err or "PerDayPer" in err:
+                            raise
+                        # Per-minute quota: wait if delay is short, then retry once
+                        delay = _extract_retry_delay(err)
+                        if attempt == 0 and 0 < delay <= 30:
+                            print(f"[OCR] {model_name} rate-limited, waiting {delay}s…")
+                            time.sleep(delay)
+                            continue
+                    raise
         except Exception as e:
             last_error = e
             print(f"[OCR] Gemini {model_name} failed: {e}")
             continue
-            
+
     if last_error is not None:
         raise last_error
     raise RuntimeError("Gemini OCR failed for all model variants")
 
 
 def cloud_ocr_gemini_structured(image_path):
-    """Extract structured form content using Gemini and return canonical JSON dict."""
-    try:
-        import google.generativeai as genai
-    except ImportError:
-        raise ImportError("Please install: pip install google-generativeai")
+    """Extract structured form content using Gemini (google-genai SDK) and return canonical JSON dict."""
+    from google import genai as gai
+    import PIL.Image
 
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise ValueError("GEMINI_API_KEY not found. Get free key from: https://aistudio.google.com/app/apikey")
 
-    genai.configure(api_key=api_key)  # type: ignore[attr-defined]
+    client = gai.Client(api_key=api_key)
 
     model_names = [
         "gemini-2.5-flash",
-        "gemini-2.0-flash",
         "gemini-1.5-flash",
-        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash-8b",
     ]
     last_error = None
 
-    import PIL.Image
     img = PIL.Image.open(image_path)
     prompt = (
         "You are a form extraction engine. Read this form image and return ONLY valid JSON with this schema: "
-        "{\"document_type\": string, \"full_text\": string, \"fields\": [{\"label\": string, \"value\": string}], \"table\": [object]}. "
+        '{"document_type": string, "full_text": string, "fields": [{"label": string, "value": string}], "table": [object]}. '
         "Rules: 1) Preserve field labels exactly. 2) Put handwritten or filled values in value. "
         "3) If value is empty, use empty string. 4) Do not include markdown or explanations."
     )
 
     for model_name in model_names:
+        print(f"[OCR] Trying Gemini structured model: {model_name}")
         try:
-            print(f"[OCR] Trying Gemini structured model: {model_name}")
-            model = genai.GenerativeModel(model_name)  # type: ignore[attr-defined]
-            response = model.generate_content([prompt, img])
-            raw = _strip_json_fences(response.text)
-            parsed = json.loads(raw)
+            for attempt in range(2):
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=[prompt, img],
+                    )
+                    raw = _strip_json_fences((response.text or "").strip())
+                    parsed = json.loads(raw)
 
-            fields = parsed.get("fields", []) or []
-            normalized_fields = []
-            for item in fields:
-                if isinstance(item, dict):
-                    normalized_fields.append({
-                        "label": str(item.get("label", "") or "").strip(),
-                        "value": str(item.get("value", "") or "").strip(),
-                    })
+                    fields = parsed.get("fields", []) or []
+                    normalized_fields = [
+                        {
+                            "label": str(item.get("label", "") or "").strip(),
+                            "value": str(item.get("value", "") or "").strip(),
+                        }
+                        for item in fields
+                        if isinstance(item, dict)
+                    ]
 
-            table = parsed.get("table", [])
-            if not isinstance(table, list):
-                table = []
+                    table = parsed.get("table", [])
+                    if not isinstance(table, list):
+                        table = []
 
-            return {
-                "document_type": str(parsed.get("document_type", "STRUCTURED_FORM") or "STRUCTURED_FORM"),
-                "full_text": str(parsed.get("full_text", "") or ""),
-                "fields": normalized_fields,
-                "table": table,
-            }
+                    return {
+                        "document_type": str(parsed.get("document_type", "STRUCTURED_FORM") or "STRUCTURED_FORM"),
+                        "full_text": str(parsed.get("full_text", "") or ""),
+                        "fields": normalized_fields,
+                        "table": table,
+                    }
+                except Exception as inner_exc:
+                    err = str(inner_exc)
+                    if "429" in err or "RESOURCE_EXHAUSTED" in err:
+                        if "PerDay" in err or "PerDayPer" in err:
+                            raise
+                        delay = _extract_retry_delay(err)
+                        if attempt == 0 and 0 < delay <= 30:
+                            print(f"[OCR] {model_name} rate-limited, waiting {delay}s…")
+                            time.sleep(delay)
+                            continue
+                    raise
         except Exception as e:
             last_error = e
             print(f"[OCR] Gemini structured {model_name} failed: {e}")
@@ -594,6 +603,270 @@ def gemini_reason_over_ocr_layout(
         "review_reasons": parsed.get("review_reasons", []) if isinstance(parsed.get("review_reasons", []), list) else [],
         "raw": parsed,
     }
+
+
+async def _html_to_png_async(html: str, output_path: str) -> bool:
+    """Render an HTML string to PNG using Playwright Async API."""
+    from playwright.async_api import async_playwright
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch()
+        try:
+            page = await browser.new_page(viewport={"width": 900, "height": 1200})
+            await page.set_content(html, wait_until="networkidle")
+            # Resize to content height so cards are not clipped.
+            content_height = await page.evaluate("() => document.body.scrollHeight")
+            await page.set_viewport_size({"width": 900, "height": max(400, int(content_height) + 60)})
+            await page.screenshot(path=output_path, full_page=True)
+        finally:
+            await browser.close()
+
+    return True
+
+
+def _html_to_png(html: str, output_path: str) -> bool:
+    """Sync wrapper that safely executes async Playwright rendering."""
+    try:
+        try:
+            asyncio.get_running_loop()
+            in_event_loop = True
+        except RuntimeError:
+            in_event_loop = False
+
+        if not in_event_loop:
+            return asyncio.run(_html_to_png_async(html, output_path))
+
+        # If we're already in FastAPI's loop, render in a worker thread.
+        result: dict[str, Any] = {"ok": False, "err": None}
+
+        def _runner() -> None:
+            try:
+                result["ok"] = asyncio.run(_html_to_png_async(html, output_path))
+            except Exception as exc:  # pragma: no cover - defensive bridge code
+                result["err"] = exc
+
+        t = threading.Thread(target=_runner, daemon=True)
+        t.start()
+        t.join()
+
+        if result["err"]:
+            raise result["err"]
+
+        return bool(result["ok"])
+    except Exception as exc:
+        print(f"[RENDER] Playwright render failed: {exc}")
+        return False
+
+
+def _generate_with_imagen(
+    prompt: str,
+    output_path: str,
+) -> Optional[str]:
+    """
+    Generate an image with Vertex AI Imagen 3 and save to output_path.
+    Returns output_path on success, None when Imagen is unavailable
+    (billing disabled, API not enabled, or SDK not installed).
+    """
+    project = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+    location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1").strip()
+    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+
+    if not project:
+        print("[IMAGEN] GOOGLE_CLOUD_PROJECT not set, skipping Imagen")
+        return None
+
+    # Resolve relative credential paths from the project root
+    if creds_path and not os.path.isabs(creds_path):
+        creds_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), creds_path
+        )
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = creds_path
+
+    try:
+        import vertexai
+        from vertexai.preview.vision_models import ImageGenerationModel
+    except ImportError:
+        print("[IMAGEN] google-cloud-aiplatform not installed, skipping Imagen")
+        return None
+
+    try:
+        vertexai.init(project=project, location=location)
+        model = ImageGenerationModel.from_pretrained("imagen-3.0-generate-001")
+        print("[IMAGEN] Generating image with Imagen 3…")
+        resp = model.generate_images(
+            prompt=prompt,
+            number_of_images=1,
+            aspect_ratio="3:4",
+        )
+        if not resp.images:
+            print("[IMAGEN] No images returned")
+            return None
+        resp.images[0].save(output_path)
+        print(f"[IMAGEN] Saved: {output_path} ({os.path.getsize(output_path)} bytes)")
+        return output_path
+    except Exception as exc:
+        err_str = str(exc)
+        if "BILLING_DISABLED" in err_str or "billing" in err_str.lower():
+            print("[IMAGEN] Billing not enabled on GCP project — skipping Imagen")
+        elif "403" in err_str or "PermissionDenied" in err_str:
+            print(f"[IMAGEN] Permission denied — ensure service account has 'Vertex AI User' role: {exc}")
+        else:
+            print(f"[IMAGEN] Failed ({type(exc).__name__}): {exc}")
+        return None
+
+
+def generate_digital_form_image_gemini(
+    extracted_text: str,
+    doc_type: str,
+    output_path: str,
+) -> Optional[str]:
+    """
+    Pipeline:
+      Extracted text (from OCR/Gemini)
+        → [Priority 1] Vertex AI Imagen 3  (if billing enabled)
+        → [Priority 2] Gemini generates HTML card → Playwright renders → PNG
+
+    Returns output_path on success, None on failure (caller falls back to PIL).
+    Env vars: GEMINI_API_KEY  (HTML path)
+             GOOGLE_CLOUD_PROJECT + GOOGLE_APPLICATION_CREDENTIALS  (Imagen path)
+    """
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+
+    doc_type_label = str(doc_type or "document").strip()
+
+    # ── Priority 1: Vertex AI Imagen 3 ────────────────────────────────────
+    imagen_out = output_path.replace(".png", "_imagen.png") if output_path.endswith(".png") else output_path + "_imagen.png"
+    imagen_prompt = (
+        f"A professional digital document card. Document type: {doc_type_label}. "
+        "Clean white background, dark navy header bar, neat rows of text. "
+        "Footer text: 'Digitized by DOC-INTEL AI'. "
+        "Content summary: " + (extracted_text[:800] if extracted_text else "No content available.")
+    )
+    imagen_result = _generate_with_imagen(imagen_prompt, imagen_out)
+    if imagen_result:
+        return imagen_result
+
+    # ── Priority 2: Gemini HTML → Playwright PNG ───────────────────────────
+    if not api_key:
+        print("[RENDER] GEMINI_API_KEY not set, skipping HTML render")
+        return None
+
+    prompt = f"""You are a professional UI generator and document designer.
+
+Convert the following extracted text into a clean, modern, well-structured HTML card.
+
+Document type: {doc_type_label}
+
+Extracted content:
+{extracted_text}
+
+Rules:
+- Return ONLY valid HTML — no markdown, no explanation, no code fences
+- Use a single self-contained <div> root with all styles inline or in a <style> block
+- White background, professional sans-serif font (system-ui, Arial)
+- Width: 860px, auto height, padding 40px
+- Add a branded header bar (dark navy #1e293b) with the document type as title
+- List every line as a clean row — label in bold if key:value format, otherwise plain text
+- Alternate row background (#f8fafc / #ffffff) for readability
+- Add a subtle footer: "Digitized by DOC-INTEL AI"
+- No external URLs, no images, no JavaScript
+"""
+
+    html_output: Optional[str] = None
+
+    # Model preference list — first available/non-overloaded one wins
+    _RENDER_MODELS = [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+    ]
+
+    def _call_genai_new(model_name: str) -> Optional[str]:
+        """Try new google-genai SDK."""
+        import time
+        try:
+            from google import genai as gai
+            client = gai.Client(api_key=api_key)
+            for attempt in range(3):
+                try:
+                    resp = client.models.generate_content(
+                        model=model_name,
+                        contents=prompt,
+                    )
+                    return (resp.text or "").strip()
+                except Exception as e:
+                    err = str(e)
+                    if "503" in err or "UNAVAILABLE" in err or "overloaded" in err.lower():
+                        wait = 2 ** attempt
+                        print(f"[RENDER] {model_name} busy (attempt {attempt+1}), retrying in {wait}s…")
+                        time.sleep(wait)
+                        continue
+                    raise
+        except ImportError:
+            pass
+        except Exception as exc:
+            print(f"[RENDER] google-genai {model_name} failed ({type(exc).__name__}): {exc}")
+        return None
+
+    def _call_genai_legacy(model_name: str) -> Optional[str]:
+        """Try legacy google-generativeai SDK as fallback."""
+        import time
+        try:
+            import google.generativeai as genai_legacy  # type: ignore
+            genai_legacy.configure(api_key=api_key)
+            model = genai_legacy.GenerativeModel(model_name)
+            for attempt in range(3):
+                try:
+                    resp = model.generate_content(prompt)
+                    return (resp.text or "").strip()
+                except Exception as e:
+                    err = str(e)
+                    if "503" in err or "UNAVAILABLE" in err or "overloaded" in err.lower():
+                        wait = 2 ** attempt
+                        print(f"[RENDER] legacy {model_name} busy (attempt {attempt+1}), retrying in {wait}s…")
+                        time.sleep(wait)
+                        continue
+                    raise
+        except ImportError:
+            pass
+        except Exception as exc:
+            print(f"[RENDER] legacy genai {model_name} failed ({type(exc).__name__}): {exc}")
+        return None
+
+    def _clean_html(raw: str) -> Optional[str]:
+        raw = raw.strip()
+        if raw.startswith("```"):
+            lines = raw.splitlines()[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            raw = "\n".join(lines).strip()
+        return raw if raw.startswith("<") else None
+
+    for model_name in _RENDER_MODELS:
+        print(f"[RENDER] Trying HTML generation with {model_name}…")
+        raw = _call_genai_new(model_name)
+        if not raw:
+            raw = _call_genai_legacy(model_name)
+        if raw:
+            html_output = _clean_html(raw)
+            if html_output:
+                print(f"[RENDER] HTML generated by {model_name} ({len(html_output)} chars)")
+                break
+            else:
+                print(f"[RENDER] {model_name} did not return HTML, got: {(raw or '')[:80]}")
+
+    if not html_output:
+        print("[RENDER] Gemini returned no usable HTML")
+        return None
+
+    print(f"[RENDER] Gemini HTML generated ({len(html_output)} chars), rendering with Playwright…")
+    success = _html_to_png(html_output, output_path)
+    if success and os.path.exists(output_path):
+        print(f"[RENDER] PNG saved: {output_path}")
+        return output_path
+
+    return None
 
 
 def run_enterprise_idp_pipeline(

@@ -41,6 +41,7 @@ class MongoIDPStore:
         # every single API request.  A re-check is done at most every 30 s.
         self._last_ping_ok: bool = False
         self._last_ping_time: float = 0.0
+        self._last_error: Optional[str] = None
 
     @classmethod
     def from_env(cls) -> "MongoIDPStore":
@@ -56,34 +57,47 @@ class MongoIDPStore:
 
         if self._use_mock:
             assert mongomock is not None
-            self._client = mongomock.MongoClient()
+            client = mongomock.MongoClient()
         else:
             assert self.uri is not None
             assert MongoClient is not None
-            self._client = MongoClient(self.uri, serverSelectionTimeoutMS=3000)
-        self._db = self._client[self.db_name]
+            client = MongoClient(self.uri, serverSelectionTimeoutMS=5000)
 
-        self._db.documents.create_index("document_id", unique=True)
-        self._db.users.create_index("user_id", unique=True)
-        self._db.users.create_index("email", unique=True)
-        self._db.users.create_index("username", unique=True)
-        self._db.templates.create_index("template_id", unique=True)
-        self._db.field_predictions.create_index([("document_id", 1), ("prediction_id", 1)])
-        self._db.review_tasks.create_index([("document_id", 1), ("task_id", 1)])
-        self._db.review_tasks.create_index("status")
-        self._db.model_runs.create_index([("document_id", 1), ("run_id", 1)])
-        self._db.extraction_blocks.create_index([("document_id", 1), ("block_id", 1)])
-        self._db.extraction_results.create_index("document_id")
-        self._db.ai_processing_logs.create_index("document_id")
-        self._db.review_corrections.create_index("document_id")
-        self._db.embeddings.create_index("document_id")
-        self._db.counters.create_index("name", unique=True)
+        db = client[self.db_name]
+
+        # Verify the connection is live before caching — raises
+        # ServerSelectionTimeoutError if the server is unreachable.
+        if not self._use_mock:
+            db.command("ping")
+
+        db.documents.create_index("document_id", unique=True)
+        db.users.create_index("user_id", unique=True)
+        db.users.create_index("email", unique=True)
+        db.users.create_index("username", unique=True)
+        db.templates.create_index("template_id", unique=True)
+        db.field_predictions.create_index([("document_id", 1), ("prediction_id", 1)])
+        db.review_tasks.create_index([("document_id", 1), ("task_id", 1)])
+        db.review_tasks.create_index("status")
+        db.model_runs.create_index([("document_id", 1), ("run_id", 1)])
+        db.extraction_blocks.create_index([("document_id", 1), ("block_id", 1)])
+        db.extraction_results.create_index("document_id")
+        db.ai_processing_logs.create_index("document_id")
+        db.review_corrections.create_index("document_id")
+        db.embeddings.create_index("document_id")
+        db.counters.create_index("name", unique=True)
+
+        # Only cache after full successful setup
+        self._client = client
+        self._db = db
         return self._db
 
     def _get_db_or_none(self):
         try:
             return self._connect()
         except Exception:
+            # Reset so future calls can retry the connection
+            self._db = None
+            self._client = None
             return None
 
     def _strip_mongo_id(self, payload: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -124,6 +138,8 @@ class MongoIDPStore:
         connected = bool(health.get("enabled") and health.get("connected"))
         self._last_ping_ok = connected
         self._last_ping_time = now
+        if not connected:
+            self._last_error = health.get("error")
         return connected
 
     def create_user(self, username: str, email: str, password_hash: str) -> Optional[dict[str, Any]]:
@@ -537,12 +553,23 @@ class MongoIDPStore:
                 "database": self.db_name,
             }
         except Exception as exc:
+            # Reset cached client so the next call retries the connection
+            self._db = None
+            self._client = None
+            self._last_ping_ok = False
+            error_msg = str(exc)
+            hint = ""
+            if "TLSV1_ALERT_INTERNAL_ERROR" in error_msg or "SSL handshake failed" in error_msg:
+                hint = (
+                    " → Your current IP is likely not whitelisted in MongoDB Atlas."
+                    " Go to Atlas → Network Access → Add IP Address, then restart the server."
+                )
             return {
                 "enabled": True,
                 "configured": True,
                 "connected": False,
                 "database": self.db_name,
-                "error": str(exc),
+                "error": error_msg + hint,
             }
 
     def upsert_document_bundle(
